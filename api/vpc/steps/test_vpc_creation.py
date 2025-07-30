@@ -1,9 +1,8 @@
 """
-AWS VPC Creation and Deletion Test Steps
+AWS VPC Creation Test Steps - Single Scenario
 
 API Endpoints:
-  • POST    /cloud/vpc                       – create a VPC
-  • DELETE  /cloud/vpi/{vpcId}               – delete a VPC with payload
+  • POST    /cloud/vpc                        create a VPC
 
 Model for VPC Creation:
 {
@@ -20,14 +19,311 @@ Model for VPC Creation:
     "additionalProp3": "string"
   }
 }
-
-Model for VPC Deletion:
-{
-  "cloudAccountId": 1,
-  "cloudProvider": "aws",
-  "cloudRegion": "us-east-1"
-}
 """
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import Any, Dict
+
+import requests
+from pytest_bdd import given, when, then, scenarios, parsers
+
+
+logger = logging.getLogger(__name__)
+
+mcn: Dict[str, Any] = {}           
+vpc_data: Dict[str, Any] = {}      
+response_data: Dict[str, requests.Response] = {}  
+
+
+scenarios("../vpc_create.feature")
+
+
+@given("I have a registered AWS account")
+def given_registered_aws_account() -> None:
+    """Put an AWS account id into the global state, validate with match/case."""
+    mcn["aws_id"] = "1"         
+    match mcn:
+        case {"aws_id": str(acc_id)} if acc_id:
+            logger.info(f"✓ AWS account id configured: {acc_id}")
+        case _:
+            assert False, "AWS account id must be present and non-empty"
+
+
+@given("the AWS API is accessible")
+def given_api_accessible(izo_mcn_url) -> None:
+    """Best-effort health probe; does not fail test if /health is absent."""
+    health_url = f"{izo_mcn_url}/health"
+
+    try:
+        resp = requests.get(health_url, timeout=5)
+        logger.info(f"Health probe {health_url} → {resp.status_code}")
+        
+        match resp.status_code:
+            case 200:
+                logger.info("✓ AWS API is healthy")
+            case 404:
+                logger.info("Health endpoint not found for AWS (acceptable)")
+            case code if 400 <= code < 500:
+                logger.warning(f"AWS health check returned client error {code}")
+            case code if code >= 500:
+                logger.warning(f"AWS health check returned server error {code}")
+            case _:
+                logger.warning(f"AWS health check returned unexpected status {resp.status_code}")
+                
+    except requests.exceptions.RequestException as exc:
+        logger.warning(f"AWS health check failed: {exc}")
+
+
+@given("the VPC details are:")
+def given_vpc_details(docstring) -> None:
+    # inside given_vpc_details(docstring):
+
+    auto_name  = os.getenv("VPC_BULK_NAME")
+    auto_cidr  = os.getenv("VPC_BULK_CIDR")
+    auto_stack = os.getenv("VPC_BULK_STACK")
+
+    if auto_name and auto_cidr and auto_stack:
+        raw = f"""
+        cidrBlock={auto_cidr}
+        cloudAccountId=1
+        cloudProvider=aws
+        cloudRegion=us-east-1
+        cloudResourceGroup=
+        name={auto_name}
+        stackName={auto_stack}
+        tagName={auto_name}
+        """.strip()
+        docstring=raw
+        
+    global vpc_data
+    vpc_data.clear()
+
+    for raw in docstring.strip().splitlines():
+        if "=" not in raw:
+            continue
+
+        key, val = (part.strip() for part in raw.split("=", 1))
+
+        match key:
+            case "cloudAccountId":
+                vpc_data[key] = int(val) if val else int(mcn.get("aws_id", 1))
+            case "tagName":
+                vpc_data.setdefault("tags", {})["Name"] = val
+            case "cloudResourceGroup" if not val:
+                vpc_data[key] = ""
+            case "cloudProvider":
+                vpc_data[key] = val if val else "aws"
+            case "cloudRegion":
+                vpc_data[key] = val
+                mcn["vpc_region"] = val  
+            case _:
+                vpc_data[key] = val
+
+    
+    vpc_data.setdefault("cloudAccountId", int(mcn.get("aws_id", 1)))
+    vpc_data.setdefault("cloudProvider", "aws")
+    vpc_data.setdefault("cloudResourceGroup", "")
+    vpc_data.setdefault("cloudRegion", "us-east-1")
+    
+    
+    mcn["vpc_region"] = vpc_data.get("cloudRegion", "us-east-1")
+
+    match vpc_data:
+        case dict() if vpc_data:
+            logger.info("✓ Parsed VPC payload:\n%s",
+                        json.dumps(vpc_data, indent=2, default=str))
+        case _:
+            assert False, "VPC details table was empty"
+
+# ------------------------------------------------------------------------------
+#  WHEN STEPS
+# ------------------------------------------------------------------------------
+@when("I send a POST request to create a VPC on AWS")
+def when_post_create_vpc(izo_mcn_url, default_headers) -> None:
+    """Send POST request to create VPC on AWS and capture VPC ID for logging"""
+    url = f"{izo_mcn_url}/cloud/vpc"
+    logger.info(f" Initiating VPC creation request")
+    logger.info(f" Endpoint: {url}")
+    logger.info(f" Request headers: {json.dumps(default_headers, indent=2)}")
+    logger.info(f" VPC creation payload:\n{json.dumps(vpc_data, indent=2)}")
+
+    try:
+        response_data["response"] = requests.post(
+            url,
+            headers=default_headers,
+            data=json.dumps(vpc_data)
+        )
+        
+        logger.info(f" Response Status: {response_data['response'].status_code}")
+        logger.info(f" Response Body: {response_data['response'].text}")
+        
+        
+        if response_data["response"].status_code == 200:
+            logger.info(" VPC creation request completed successfully")
+        else:
+            logger.warning(f"  VPC creation returned non-200 status: {response_data['response'].status_code}")
+            
+    except requests.exceptions.RequestException as exc:
+        logger.error(f" VPC creation request failed with exception: {exc}")
+        raise
+
+# ------------------------------------------------------------------------------
+#  THEN STEPS – status code verification
+# ------------------------------------------------------------------------------
+def _assert_status(expected: int) -> None:
+    """Verify the API response status code using match/case"""
+    actual = response_data["response"].status_code
+    response_body = response_data["response"].text
+
+    match actual:
+        case code if code == expected:
+            logger.info(f" Response status code validation passed: {code}")
+        case 400:
+            assert False, f"Bad Request (400): Invalid VPC configuration. Response: {response_body}"
+        case 401:
+            assert False, f"Unauthorized (401): Check authentication headers"
+        case 403:
+            assert False, f"Forbidden (403): Insufficient permissions for VPC creation"
+        case 404:
+            assert False, f"Not Found (404): API endpoint not found"
+        case 409:
+            assert False, f"Conflict (409): VPC already exists or naming conflict. Response: {response_body}"
+        case 500:
+            assert False, f"Internal Server Error (500): {response_body}"
+        case code if code >= 500:
+            assert False, f"Server Error ({code}): {response_body}"
+        case _:
+            assert False, f"Expected status {expected}, got {actual}. Response: {response_body}"
+
+
+@then(parsers.cfparse("the AWS VPC creation API response should be {status_code:d}"))
+def then_create_status(status_code: int) -> None:
+    """Verify VPC creation response status code"""
+    logger.info(f"🔍 Validating VPC creation response status code")
+    _assert_status(status_code)
+
+# ------------------------------------------------------------------------------
+#  THEN STEPS – body-content assertions with enhanced VPC ID logging
+# ------------------------------------------------------------------------------
+@then("the AWS VPC creation API response body must contain a VPC ID")
+def then_body_contains_vpc_id() -> None:
+    """
+    Verify response contains VPC ID using match/case patterns with comprehensive logging
+    Returns the VPC ID in logs for easy identification and tracking
+    """
+    logger.info(" Analyzing VPC creation response for VPC ID extraction")
+    
+    try:
+        resp_json = response_data["response"].json()
+        logger.info(f" Full API response structure:\n{json.dumps(resp_json, indent=2)}")
+    except json.JSONDecodeError:
+        response_body = response_data["response"].text
+        logger.error(f" Response is not valid JSON: {response_body}")
+        assert False, f"Response is not valid JSON: {response_body}"
+
+    vpc_id: str | None = None
+    extraction_method: str = ""
+
+    match resp_json:
+        
+        case {"id": str(id_val)} if id_val.strip():
+            vpc_id = id_val.strip()
+            extraction_method = "direct 'id' field"
+        case {"vpcId": str(vpc_val)} if vpc_val.strip():
+            vpc_id = vpc_val.strip()
+            extraction_method = "direct 'vpcId' field"
+        
+        case {"data": {"id": str(id_val)}} if id_val.strip():
+            vpc_id = id_val.strip()
+            extraction_method = "nested 'data.id' field"
+        case {"data": {"vpcId": str(vpc_val)}} if vpc_val.strip():
+            vpc_id = vpc_val.strip()
+            extraction_method = "nested 'data.vpcId' field"
+        
+        case dict() as body:
+            logger.info(" Performing fallback search for VPC ID in response")
+            for field in ("id", "vpcId"):
+                match body.get(field):
+                    case str(x) if x.strip():
+                        vpc_id = x.strip()
+                        extraction_method = f"fallback direct '{field}' field"
+                        break
+                    case _:
+                        
+                        if "data" in body and isinstance(body["data"], dict):
+                            match body["data"].get(field):
+                                case str(x) if x.strip():
+                                    vpc_id = x.strip()
+                                    extraction_method = f"fallback nested 'data.{field}' field"
+                                    break
+                                case _:
+                                    continue
+        case _:
+            logger.warning("  Response structure doesn't match expected patterns")
+
+    match vpc_id:
+        case str(v) if v and v.startswith("vpc-"):
+            
+            mcn["aws_vpc_id"] = v
+            
+            
+            logger.info("="*60)
+            logger.info(" VPC CREATION SUCCESSFUL!")
+            logger.info("="*60)
+            logger.info(f" VPC ID: {v}")
+            logger.info(f" Region: {mcn.get('vpc_region', 'us-east-1')}")
+            logger.info(f"  VPC Name: {vpc_data.get('name', 'N/A')}")
+            logger.info(f" CIDR Block: {vpc_data.get('cidrBlock', 'N/A')}")
+            logger.info(f" Account ID: {vpc_data.get('cloudAccountId', 'N/A')}")
+            logger.info(f"  Provider: {vpc_data.get('cloudProvider', 'N/A')}")
+            logger.info(f" Stack Name: {vpc_data.get('stackName', 'N/A')}")
+            logger.info(f" Extraction Method: {extraction_method}")
+            logger.info("="*60)
+            
+            
+            logger.info(f"VPC_CREATED|ID={v}|REGION={mcn.get('vpc_region', 'us-east-1')}|NAME={vpc_data.get('name', 'N/A')}", flush=True)
+            
+        case str(v) if v:
+            logger.warning(f"Found ID but doesn't match VPC format: {v}")
+            assert False, f"Found ID '{v}' but it doesn't match expected VPC ID format (vpc-xxxxxxxxx)"
+        case _:
+            logger.error(" VPC ID extraction failed")
+            logger.error(f" Response analysis:")
+            logger.error(f"   - Response type: {type(resp_json)}")
+            logger.error(f"   - Response keys: {list(resp_json.keys()) if isinstance(resp_json, dict) else 'Not a dict'}")
+            logger.error(f"   - Full response: {json.dumps(resp_json, indent=2)}")
+            assert False, (
+                f"VPC ID not found in response. "
+                f"Response: {json.dumps(resp_json, indent=2)}"
+            )
+
+
+@then("cleanup any created AWS VPC resources")
+def then_cleanup_log() -> None:
+    """Log created VPC resources for cleanup tracking"""
+    match mcn:
+        case {"aws_vpc_id": str(vpc_id)} if vpc_id:
+            logger.info("="*50)
+            logger.info(" CLEANUP TRACKING")
+            logger.info("="*50)
+            logger.info(f" VPC ID Created: {vpc_id}")
+            logger.info(f" Region: {mcn.get('vpc_region', 'us-east-1')}")
+            logger.info(f"  VPC Name: {vpc_data.get('name', 'N/A')}")
+            logger.info("  Note: Manual cleanup may be required")
+            logger.info("="*50)
+            
+            
+            logger.info(f"CLEANUP_REQUIRED|VPC_ID={vpc_id}|REGION={mcn.get('vpc_region', 'us-east-1')}")
+        case _:
+            logger.info("  No AWS VPC resources created to track for cleanup")
+
+
+
+'''
 
 from __future__ import annotations
 
@@ -312,7 +608,7 @@ def then_cleanup_log() -> None:
             logger.info(f"✓ AWS VPC created with ID: {vpc_id}")
             logger.info("Note: Manual cleanup may be required")
         case _:
-            logger.info("No AWS VPC resources to cleanup")
+            logger.info("No AWS VPC resources to cleanup")'''
 
 
 
